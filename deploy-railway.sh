@@ -1,40 +1,65 @@
 #!/bin/bash
+# Complete Railway Deployment Script
+# Run this once to fix all deployment issues
 
-echo "🚀 Deploying Orange HR Dashboard to Railway"
-echo "=========================================="
+echo "🚀 Starting Railway deployment fix..."
 
-# Check if Railway CLI is installed
-if ! command -v railway &> /dev/null; then
-    echo "❌ Railway CLI not found. Installing..."
-    brew install railway
+# Step 1: Remove problematic files
+echo "📦 Removing Dockerfile..."
+rm -f Dockerfile
+
+# Step 2: Add Railway configuration
+echo "⚙️ Creating Railway config..."
+cat > railway.json << 'EOF'
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npm install"
+  },
+  "deploy": {
+    "startCommand": "node deploy-server.js",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 60
+  }
+}
+EOF
+
+# Step 3: Add ignore file
+echo "📝 Creating .railwayignore..."
+cat > .railwayignore << 'EOF'
+node_modules/
+.git/
+.DS_Store
+*.log
+.env
+*.pem
+*.key
+EOF
+
+# Step 4: Update package.json if needed
+echo "📄 Checking package.json..."
+if ! grep -q '"start":' package.json; then
+  echo "Adding start script to package.json..."
+  npm set-script start "node deploy-server.js"
 fi
 
-echo "✅ Railway CLI installed"
+# Step 5: Commit and push
+echo "🔧 Committing changes..."
+git add .
+git commit -m "Fix Railway deployment: remove Dockerfile, add config" || echo "No changes to commit"
+
+echo "🚀 Pushing to GitHub..."
+git push origin main
 
 echo ""
-echo "📋 Deployment Steps:"
-echo "1. Login to Railway (opens browser):"
-echo "   railway login"
+echo "✅ DEPLOYMENT FIX COMPLETE!"
 echo ""
-echo "2. Initialize project:"
-echo "   railway init"
+echo "📋 NEXT STEPS:"
+echo "1. Go to https://railway.app"
+echo "2. Click on 'orange-hr-dashboard-api'"
+echo "3. Click 'Redeploy'"
+echo "4. Wait 2 minutes"
+echo "5. Copy HTTPS URL"
+echo "6. Update Linear webhook with that URL"
 echo ""
-echo "3. Set environment variables:"
-echo "   railway variables set LINEAR_API_KEY=lin_api_JdwKnABcckFSZR54HYbBBI9AVTxwLoZt8rF2kvgB"
-echo "   railway variables set NODE_ENV=production"
-echo "   railway variables set PORT=3003"
-echo ""
-echo "4. Deploy:"
-echo "   railway up"
-echo ""
-echo "5. Get URL:"
-echo "   railway status"
-echo ""
-echo "🎯 After deployment:"
-echo "- Update Linear webhook with Railway HTTPS URL"
-echo "- Test by creating issue in Linear"
-echo "- Check logs: railway logs"
-echo ""
-echo "Ready to deploy? Run the commands above in order."
-echo ""
-echo "For detailed instructions, see railway-setup.md"
+echo "🛠️ If still fails, check Railway logs for specific errors."
