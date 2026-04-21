@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: orange-hr-dashboard-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node deploy-server.js
+    envVars:
+      - key: LINEAR_API_KEY
+        sync: false
+      - key: LINEAR_WEBHOOK_SECRET
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3003
+    healthCheckPath: /health
+    autoDeploy: true
+    domains:
+      - orange-hr-dashboard.onrender.com
