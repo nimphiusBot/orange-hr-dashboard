@@ -131,19 +131,53 @@ app.get('/api/dashboard', async (req, res) => {
       }
     }
     
-    // Build activity feed from Linear issue data
-    const activity = linearIssues
+    // Build activity feed from Linear issue data + issue history timeline
+    const currentStateActivity = linearIssues
       .filter(i => i.stateType !== 'backlog')
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
       .map(i => ({
         id: `linear-${i.id}`,
         type: 'approval',
         user: i.agentId || 'Unassigned',
-        action: i.state === 'In Progress' ? 'Started work on' : `Updated ${i.identifier}`,
+        action: i.state === 'In Progress' ? 'Started work on' : i.state === 'In Review' ? 'In review' : `Updated ${i.identifier}`,
         details: `${i.title} (${i.priorityLabel})`,
         time: timeAgo(i.updatedAt),
+        timestamp: i.updatedAt,
         avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${i.agentId || 'unassigned'}`
       }))
+
+    // Flatten all issue history events into the activity feed
+    const historyActivity = linearIssues
+      .flatMap(i =>
+        (i.history || [])
+          .filter(h => h.fromState || h.toState || h.fromAssignee || h.toAssignee)
+          .map(h => {
+            let action: string
+            if (h.fromState && h.toState) {
+              action = `${h.fromState} → ${h.toState}`
+            } else if (h.toAssignee) {
+              action = `Assigned to ${h.toAssignee}`
+            } else if (h.fromAssignee && !h.toAssignee) {
+              action = `Unassigned from ${h.fromAssignee}`
+            } else {
+              action = `Updated ${i.identifier}`
+            }
+            return {
+              id: `history-${h.id}`,
+              type: 'approval',
+              user: h.actorName || i.agentId || 'System',
+              action,
+              details: `${i.identifier}: ${i.title}`,
+              time: timeAgo(h.createdAt),
+              timestamp: h.createdAt,
+              avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${h.actorName || i.agentId || 'system'}`
+            }
+          })
+      )
+
+    // Merge and sort by timestamp descending
+    const activity = [...currentStateActivity, ...historyActivity]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
     
     res.json({
       team: teamFromGateway,

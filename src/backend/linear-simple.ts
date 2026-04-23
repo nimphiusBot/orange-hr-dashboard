@@ -525,6 +525,21 @@ export async function attachAgentLabel(issueId: string, agentId: string): Promis
 }
 
 /**
+ * A single history event from a Linear issue.
+ */
+export interface IssueHistoryEvent {
+  id: string
+  createdAt: string
+  actorName: string | null
+  fromState: string | null
+  toState: string | null
+  fromStateType: string | null
+  toStateType: string | null
+  fromAssignee: string | null
+  toAssignee: string | null
+}
+
+/**
  * Result from Linear for the dashboard's "active issues" query.
  */
 export interface ActiveIssue {
@@ -542,6 +557,7 @@ export interface ActiveIssue {
   completedAt: string | null
   agentId: string | null  // extracted from agent:xxx label
   teamKey: string | null
+  history: IssueHistoryEvent[]  // issue timeline events
 }
 
 /**
@@ -586,6 +602,31 @@ export async function getActiveIssuesWithAgents(): Promise<ActiveIssue[]> {
             nodes {
               id
               name
+            }
+          }
+          history(first: 10) {
+            nodes {
+              id
+              createdAt
+              actor {
+                displayName
+              }
+              fromState {
+                id
+                name
+                type
+              }
+              toState {
+                id
+                name
+                type
+              }
+              fromAssignee {
+                displayName
+              }
+              toAssignee {
+                displayName
+              }
             }
           }
         }
@@ -635,7 +676,18 @@ export async function getActiveIssuesWithAgents(): Promise<ActiveIssue[]> {
       startedAt: issue.startedAt || null,
       completedAt: issue.completedAt || null,
       agentId,
-      teamKey: issue.team?.key || null
+      teamKey: issue.team?.key || null,
+      history: (issue.history?.nodes || []).map((h: any) => ({
+        id: h.id,
+        createdAt: h.createdAt,
+        actorName: h.actor?.displayName || null,
+        fromState: h.fromState?.name || null,
+        toState: h.toState?.name || null,
+        fromStateType: h.fromState?.type || null,
+        toStateType: h.toState?.type || null,
+        fromAssignee: h.fromAssignee?.displayName || null,
+        toAssignee: h.toAssignee?.displayName || null
+      }))
     }
   })
 }
