@@ -5,6 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 
 export interface AgentMapping {
   linearAssignee: string;
@@ -232,6 +233,20 @@ export function startAgentWithLinearIssue(agentId: string, issue: any): { succes
       timestamp: new Date().toISOString()
     });
     
+    // Clean stale session locks before spawning
+    const agentSessionDir = path.join(os.homedir(), '.openclaw', 'agents', agentId, 'sessions');
+    try {
+      if (fs.existsSync(agentSessionDir)) {
+        const lockFiles = fs.readdirSync(agentSessionDir).filter(f => f.endsWith('.lock'));
+        for (const lockFile of lockFiles) {
+          fs.unlinkSync(path.join(agentSessionDir, lockFile));
+          console.log(`🧹 Cleaned stale lock: ${lockFile}`);
+        }
+      }
+    } catch (e) {
+      // Non-fatal — stale locks don't block starting fresh
+    }
+    
     // Use spawn instead of execSync to avoid blocking
     const { spawn } = require('child_process');
     
@@ -246,13 +261,12 @@ export function startAgentWithLinearIssue(agentId: string, issue: any): { succes
       if (!env.GITHUB_TOKEN) env.GITHUB_TOKEN = process.env.GH_TOKEN
     }
     
-    // Try with --deliver --channel telegram first
+    // Use stdin pipe for the message to avoid shell escaping issues
     const child = spawn('openclaw', [
       'agent',
       '--agent', agentId,
       '--message', message,
-      '--deliver',
-      '--channel', 'telegram'
+      '--local'
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
@@ -301,7 +315,7 @@ export function startAgentWithLinearIssue(agentId: string, issue: any): { succes
         '--message', message,
         '--local'
       ], {
-        stdio: 'pipe',
+        stdio: 'ignore',
         detached: true,
         env
       });
