@@ -46,25 +46,77 @@ function logActivation(activationId: string, data: Partial<ActivationLog>) {
   }
 }
 
-// Primary mapping: Linear assignee name → OpenClaw agent ID
-const LINEAR_TO_AGENT_MAPPING: Record<string, string> = {
-  // From Linear mock data
-  'Business Analyst Platform': 'ba-platform',
-  'Design System Platform Engineer': 'design-system-engineer',
-  'Documentation Specialist': 'documentation-specialist',
-  'Head Engineer': 'main', // Orange AI
-  'QA Expert': 'qa-expert',
-  'Video Generation Assistant': 'video-assistant',
-  'Test AI Engineer': 'test-ai-engineer',
+// Primary mapping: Linear assignee name → OpenClaw agent ID with workspace and repo info
+const AGENT_CONFIGS: Record<string, { agentId: string; workspacePath: string; repoUrl: string; role: string }> = {
+  'Business Analyst Platform': {
+    agentId: 'ba-platform',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'Business Analyst'
+  },
+  'Design System Platform Engineer': {
+    agentId: 'design-system-engineer',
+    workspacePath: '/Users/openclaw/projects/storyhouse-design-system',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-design-system.git',
+    role: 'Design System Engineer'
+  },
+  'Documentation Specialist': {
+    agentId: 'documentation-specialist',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'Documentation Specialist'
+  },
+  'Head Engineer': {
+    agentId: 'main',
+    workspacePath: '/Users/openclaw/.openclaw/workspace',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-claw.git',
+    role: 'Orange AI'
+  },
+  'QA Expert': {
+    agentId: 'qa-expert',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'QA Expert'
+  },
+  'Video Generation Assistant': {
+    agentId: 'video-assistant',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'Video Generation Assistant'
+  },
+  'Test AI Engineer': {
+    agentId: 'test-ai-engineer',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'Test AI Engineer'
+  },
   
-  // Additional mappings for flexibility
-  'Business Analyst': 'ba-platform',
-  'Design System Engineer': 'design-system-engineer',
-  'Documentation': 'documentation-specialist',
-  'QA': 'qa-expert',
-  'Video Assistant': 'video-assistant',
-  'Orange AI': 'main',
+  // Aliases for flexibility
+  'Business Analyst': {
+    agentId: 'ba-platform',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'Business Analyst'
+  },
+  'Design System Engineer': {
+    agentId: 'design-system-engineer',
+    workspacePath: '/Users/openclaw/projects/storyhouse-design-system',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-design-system.git',
+    role: 'Design System Engineer'
+  },
+  'QA': {
+    agentId: 'qa-expert',
+    workspacePath: '/Users/openclaw/projects/storyhouse-main',
+    repoUrl: 'https://github.com/nimphiusBot/storyhouse-main.git',
+    role: 'QA Expert'
+  },
 };
+
+// Derive the simple mapping from AGENT_CONFIGS for backward compat
+const LINEAR_TO_AGENT_MAPPING: Record<string, string> = {};
+for (const [name, config] of Object.entries(AGENT_CONFIGS)) {
+  LINEAR_TO_AGENT_MAPPING[name] = config.agentId;
+}
 
 // Fallback mapping for common role patterns
 const ROLE_PATTERN_MAPPING: Record<string, string> = {
@@ -143,7 +195,7 @@ export function validateAgentExists(agentId: string): boolean {
     return parseInt(output.trim()) > 0;
   } catch (error) {
     console.warn(`⚠️ Could not validate agent ${agentId}:`, error.message);
-    return false; // Assume exists for fallback
+    return false; // Return false on error — no assumptions
   }
 }
 
@@ -156,7 +208,12 @@ export function startAgentWithLinearIssue(agentId: string, issue: any): { succes
   const issueTitle = issue.title || 'No title';
   const issueDescription = issue.description || 'No description';
   
-  const message = `Linear Issue ${issueIdentifier}: ${issueTitle}\n\n${issueDescription}\n\nPriority: ${issue.priorityLabel || 'Normal'}\nStatus: Approved by Nimphius\n\nPlease begin work on this issue.`;
+  // Look up agent config for repo URL and workspace
+  const agentConfig = Object.values(AGENT_CONFIGS).find(c => c.agentId === agentId);
+  const repoUrl = agentConfig?.repoUrl || 'https://github.com/nimphiusBot/storyhouse-main.git';
+  const workspacePath = agentConfig?.workspacePath || '/Users/openclaw/projects/' + agentId;
+  
+  const message = `Linear Issue ${issueIdentifier}: ${issueTitle}\n\n${issueDescription}\n\nPriority: ${issue.priorityLabel || 'Normal'}\nStatus: Approved by Nimphius\n\nRepository: ${repoUrl}\nWorkspace: ${workspacePath}\n\nGITHUB_TOKEN is available for git operations.\nClone the repo, make changes, commit, and push.\n\nPlease begin work on this issue.`;
   
   try {
     const { execSync } = require('child_process');
