@@ -2,25 +2,57 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import { WebSocketServer, WebSocket } from 'ws'
+import { gateway } from './gateway-proxy'
+import { ticketSystem } from './ticket-system'
+import { getAgentIdFromLinearAssignee, startAgentWithLinearIssue } from './agent-mapping-fixed'
+
+const GATEWAY_URL = 'http://localhost:3005'
 
 const app = express()
 const PORT = 3003
 
-// WebSocket for real-time updates
+// WebSocket for real-time updates (connects to Gateway WebSocket)
 const wss = new WebSocketServer({ port: 3004 })
 const clients = new Set<WebSocket>()
 
+// Connect to Gateway WebSocket for real-time updates
+let gatewayWs: WebSocket | null = null
+
+function connectToGatewayWebSocket() {
+  gatewayWs = new WebSocket('ws://localhost:3006')
+  
+  gatewayWs.on('open', () => {
+    console.log('📡 Connected to Gateway WebSocket')
+  })
+  
+  gatewayWs.on('message', (data) => {
+    // Forward Gateway messages to dashboard clients
+    const message = data.toString()
+    broadcast(JSON.parse(message))
+  })
+  
+  gatewayWs.on('close', () => {
+    console.log('📡 Gateway WebSocket disconnected, reconnecting...')
+    setTimeout(connectToGatewayWebSocket, 5000)
+  })
+  
+  gatewayWs.on('error', () => {
+    // Silently handle WebSocket connection errors
+    // Gateway WebSocket (port 3006) may start after HTTP (port 3005)
+  })
+}
+
 wss.on('connection', (ws) => {
   clients.add(ws)
-  console.log('📡 WebSocket client connected')
+  console.log('📡 Dashboard WebSocket client connected')
   
   ws.on('close', () => {
     clients.delete(ws)
-    console.log('📡 WebSocket client disconnected')
+    console.log('📡 Dashboard WebSocket client disconnected')
   })
 })
 
-// Broadcast to all WebSocket clients
+// Broadcast to all dashboard WebSocket clients
 function broadcast(data: any) {
   const message = JSON.stringify(data)
   clients.forEach(client => {
@@ -30,213 +62,262 @@ function broadcast(data: any) {
   })
 }
 
-app.use(cors())
+app.use(cors({
+  origin: ['http://localhost:3002', 'http://127.0.0.1:3002', 'http://localhost:3000'],
+  credentials: true
+}))
 app.use(express.json())
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
-})
-
-// Get dashboard data
-app.get('/api/dashboard', (req, res) => {
-  res.json({
-    team: [
-      {
-        id: 1,
-        name: 'Video Generation Assistant',
-        role: 'Video Generation Engineering',
-        status: 'active',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=video-gen',
-        joinDate: '2026-04-19',
-      },
-      {
-        id: 2,
-        name: 'Design System Platform Engineer',
-        role: 'Design System Architecture & Platform',
-        status: 'onboarding',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=design-system',
-        onboardingProgress: 30,
-        onboardingDays: 'Day 2 of 7',
-        joinDate: '2026-04-20',
-      },
-      {
-        id: 3,
-        name: 'Documentation Specialist',
-        role: 'Engineering Documentation & Quality',
-        status: 'onboarding',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=documentation',
-        onboardingProgress: 25,
-        onboardingDays: 'Day 2 of 7',
-        joinDate: '2026-04-20',
-      },
-      {
-        id: 4,
-        name: 'Head Engineer',
-        role: 'Engineering Leadership',
-        status: 'active',
-        avatar: 'https://github.com/nimphius.png',
-        joinDate: '2026-04-19',
-      },
-    ],
-    activity: [
-      // Linear integration activities (mock - will be replaced by real webhooks)
-      {
-        id: Date.now() - 3600000,
-        user: 'Design System Platform Engineer',
-        action: 'Created Linear issue: ORA-1 - Set up design system repository',
-        type: 'development',
-        time: '1 hour ago',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=design-system',
-        details: 'New issue for design system foundation',
-        metadata: {
-          source: 'linear',
-          issueId: 'mock-1',
-          identifier: 'ORA-1',
-          team: 'DSN',
-        },
-      },
-      {
-        id: Date.now() - 7200000,
-        user: 'Documentation Specialist',
-        action: 'Created Linear issue: ORA-2 - Implement engineering workflow',
-        type: 'documentation',
-        time: '2 hours ago',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=documentation',
-        details: 'Documentation for engineering standards',
-        metadata: {
-          source: 'linear',
-          issueId: 'mock-2',
-          identifier: 'ORA-2',
-          team: 'DOC',
-        },
-      },
-      {
-        id: Date.now() - 10800000,
-        user: 'Head Engineer',
-        action: 'Created Linear issue: ORA-3 - Create HR Dashboard ↔ Linear integration',
-        type: 'development',
-        time: '3 hours ago',
-        avatar: 'https://github.com/nimphius.png',
-        details: 'Integration between HR Dashboard and Linear',
-        metadata: {
-          source: 'linear',
-          issueId: 'mock-3',
-          identifier: 'ORA-3',
-          team: 'ENG',
-        },
-      },
-      
-      // Original activities
-      {
-        id: Date.now() - 600000,
-        user: 'Head Engineer',
-        action: 'Created engineering workflow documentation',
-        type: 'documentation',
-        time: 'Just now',
-        avatar: 'https://github.com/nimphius.png',
-        details: 'Defined PR review process, QA integration, and development standards',
-      },
-      {
-        id: Date.now() - 3600000,
-        user: 'Design System Platform Engineer',
-        action: 'Started storyhouse-design-system repository setup',
-        type: 'development',
-        time: '1 hour ago',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=design-system',
-        details: 'Initializing monorepo with TypeScript, Storybook, and Astro docs',
-      },
-      {
-        id: Date.now() - 7200000,
-        user: 'Documentation Specialist',
-        action: 'Reviewing engineering workflow documentation',
-        type: 'documentation',
-        time: '2 hours ago',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=documentation',
-        details: 'Ensuring all standards are documented and maintainable',
-      },
-      {
-        id: Date.now() - 10800000,
-        user: 'Video Generation Assistant',
-        action: 'Testing VEO3 API integration',
-        type: 'testing',
-        time: '3 hours ago',
-        avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=video-gen',
-        details: 'Successfully generated 5 test video scenes',
-      },
-    ],
-    approvals: [
-      {
-        id: 1,
-        type: 'video_generation',
-        title: 'Test Video Generation Request',
-        description: 'Scene #1 - Sunset landscape for demo',
-        requester: 'Design System Engineer',
-        cost: 0.75,
-        status: 'pending',
-        time: '10 minutes ago',
-        priority: 'medium',
-      },
-    ],
-    metrics: {
-      teamSize: 4,
-      activeMembers: 2,
-      onboardingMembers: 2,
-      approvalRate: 0,
-      avgResponseTime: '4.2 hours',
-    },
+  res.json({ 
+    status: 'ok', 
+    service: 'HR Dashboard Proxy',
+    gateway: 'connected',
+    timestamp: new Date().toISOString()
   })
 })
 
-// Approve an item
-app.post('/api/approve/:id', (req, res) => {
-  const { id } = req.params
-  console.log(`✅ Approval requested for item ${id}`)
-  
-  // Broadcast approval event
-  broadcast({
-    type: 'approval',
-    action: 'approved',
-    id,
-    timestamp: new Date().toISOString(),
-  })
-  
-  res.json({ success: true, message: `Item ${id} approved` })
+
+
+// Proxy endpoints to Gateway API
+
+// 1. Get dashboard data (team + approval queue)
+app.get('/api/dashboard', async (req, res) => {
+  try {
+    // Fetch from gateway and Linear in parallel
+    const [approvalQueue, approvedAgents, linearIssues] = await Promise.all([
+      gateway.getApprovalQueue(),
+      gateway.getApprovalQueue('APPROVED'),
+      (async () => {
+        try {
+          const { getActiveIssuesWithAgents } = await import('./linear-simple.js')
+          return await getActiveIssuesWithAgents()
+        } catch (e: any) {
+          console.warn('⚠️ Could not fetch Linear issues for team view:', e.message)
+          return [] // Non-fatal — team displays without task info
+        }
+      })()
+    ])
+    
+    // Build team from Gateway data, enriched with Linear issue info
+    const teamFromGateway = []
+    const processedNames = new Set()
+    
+    if (approvedAgents.data) {
+      for (const agent of approvedAgents.data) {
+        if (processedNames.has(agent.name)) continue
+        processedNames.add(agent.name)
+        
+        const approvedDate = agent.approvedAt ? new Date(agent.approvedAt) : new Date(agent.submittedAt)
+        
+                // Find matching Linear issue via agentId label (uses the same mapping as approval)
+        const agentIdForMatch = getAgentIdFromLinearAssignee(agent.name)
+        const matchingIssue = agentIdForMatch
+          ? linearIssues.find(i => i.agentId === agentIdForMatch)
+          : undefined
+        
+        teamFromGateway.push({
+          id: teamFromGateway.length + 1,
+          name: agent.name,
+          role: agent.role,
+          status: agent.status.toLowerCase(),
+          avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${agent.name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          joinDate: approvedDate.toISOString().split('T')[0],
+          currentTask: matchingIssue?.title || null,
+          ticketNumber: matchingIssue?.identifier || null,
+          workingSince: matchingIssue?.startedAt || matchingIssue?.createdAt || null,
+        })
+      }
+    }
+    
+    // Build activity feed from Linear issue data
+    const activity = linearIssues
+      .filter(i => i.stateType !== 'backlog')
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+      .map(i => ({
+        id: `linear-${i.id}`,
+        type: 'approval',
+        user: i.agentId || 'Unassigned',
+        action: i.state === 'In Progress' ? 'Started work on' : `Updated ${i.identifier}`,
+        details: `${i.title} (${i.priorityLabel})`,
+        time: timeAgo(i.updatedAt),
+        avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${i.agentId || 'unassigned'}`
+      }))
+    
+    res.json({
+      team: teamFromGateway,
+      activity,
+      approvals: approvalQueue.data || [],
+      metrics: {
+        teamSize: teamFromGateway.length,
+        approvedAgents: teamFromGateway.filter(m => m.status === 'approved').length,
+        activeAgents: teamFromGateway.filter(m => m.status === 'active').length,
+        onboardingAgents: teamFromGateway.filter(m => m.status === 'onboarding').length,
+        pendingApprovals: approvalQueue.count || 0,
+      }
+    })
+    
+  } catch (error) {
+    console.error('❌ Dashboard data fetch failed:', error instanceof Error ? error.message : 'Unknown error')
+    
+    res.json({
+      team: [],
+      activity: [],
+      approvals: [],
+      metrics: {
+        teamSize: 0,
+        approvedAgents: 0,
+        activeAgents: 0,
+        onboardingAgents: 0,
+        pendingApprovals: 0
+      },
+      source: 'error',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    })
+  }
 })
 
-// Deny an item
-app.post('/api/deny/:id', (req, res) => {
-  const { id } = req.params
-  console.log(`❌ Denial requested for item ${id}`)
-  
-  // Broadcast denial event
-  broadcast({
-    type: 'approval',
-    action: 'denied',
-    id,
-    timestamp: new Date().toISOString(),
-  })
-  
-  res.json({ success: true, message: `Item ${id} denied` })
+// 2. Submit agent request (proxy to Gateway)
+app.post('/api/agent-requests', async (req, res) => {
+  try {
+    const result = await gateway.submitAgentRequest(req.body)
+    
+    // Broadcast new request
+    broadcast({
+      type: 'agent_request_submitted',
+      data: result.data
+    })
+    
+    res.json(result)
+  } catch (error) {
+    console.error('Error submitting agent request:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to submit agent request'
+    })
+  }
 })
 
-// Orange HR webhook endpoint
-app.post('/webhook/orange-hr', (req, res) => {
+// 3. Get approval queue (proxy to Gateway)
+app.get('/api/approval-queue', async (req, res) => {
+  try {
+    const status = req.query.status as string || 'PENDING'
+    const result = await gateway.getApprovalQueue(status)
+    res.json(result)
+  } catch (error) {
+    console.error('Error fetching approval queue:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch approval queue'
+    })
+  }
+})
+
+// 4. Approve agent request (proxy to Gateway)
+app.post('/api/approve/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const result = await gateway.approveAgentRequest(id, {
+      ...req.body,
+      approvedBy: 'HR Dashboard'
+    })
+    
+    // Broadcast approval
+    broadcast({
+      type: 'agent_request_approved',
+      data: result.data
+    })
+    
+    res.json(result)
+  } catch (error) {
+    console.error('Error approving agent request:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to approve agent request'
+    })
+  }
+})
+
+// 5. Reject agent request (proxy to Gateway)
+app.post('/api/reject/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    const result = await gateway.rejectAgentRequest(id, {
+      ...req.body,
+      rejectedBy: 'HR Dashboard'
+    })
+    
+    // Broadcast rejection
+    broadcast({
+      type: 'agent_request_rejected',
+      data: result.data
+    })
+    
+    res.json(result)
+  } catch (error) {
+    console.error('Error rejecting agent request:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to reject agent request'
+    })
+  }
+})
+
+// 6. Orange HR webhook (for Telegram bot integration)
+app.post('/webhook/orange-hr', async (req, res) => {
+  try {
+    const event = req.body
+    console.log('📨 Orange HR webhook received:', event.type)
+    
+    // Forward to Gateway if needed, or handle locally
+    if (event.type === 'agent_request') {
+      // Create in Gateway
+      await gateway.submitAgentRequest({
+        name: event.agentName,
+        role: event.role,
+        department: event.department,
+        status: 'PENDING',
+        submittedBy: 'Telegram Bot'
+      })
+    }
+    
+    // Broadcast to dashboard clients
+    broadcast(event)
+    
+    res.json({ success: true, message: 'Webhook processed' })
+  } catch (error) {
+    console.error('Error processing webhook:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process webhook'
+    })
+  }
+})
+
+// 7. Linear webhook (forward to Gateway in future)
+app.post('/webhook/linear', (req, res) => {
   const event = req.body
-  console.log('📨 Orange HR webhook received:', event)
+  console.log('📨 Linear webhook received:', event.type || 'unknown')
   
-  // Create activity from webhook
+  // Create activity for dashboard
   const activity = {
     id: Date.now(),
-    user: 'Orange HR Bot',
-    action: `New ${event.type}: ${event.title || 'Unknown'}`,
-    type: 'hr',
+    user: 'Linear System',
+    action: `Linear issue ${event.action || 'updated'}: ${event.data?.identifier || 'Unknown'}`,
+    type: 'development',
     time: 'Just now',
-    avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=hr-bot',
-    details: event.description || 'No details provided',
+    avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=linear',
+    details: event.data?.title || 'No details',
+    metadata: {
+      source: 'linear',
+      issueId: event.data?.id,
+      identifier: event.data?.identifier,
+      team: event.data?.team?.key,
+    },
   }
   
-  // Broadcast to WebSocket clients
+  // Broadcast to dashboard clients
   broadcast({
     type: 'activity',
     data: activity,
@@ -245,170 +326,644 @@ app.post('/webhook/orange-hr', (req, res) => {
   res.json({ success: true, message: 'Webhook processed' })
 })
 
-// Linear webhook endpoint (mock for now)
-app.post('/webhook/linear', (req, res) => {
+// GitHub Webhook - Auto-create tickets from PRs/Issues
+app.post('/webhook/github', (req, res) => {
   const event = req.body
-  console.log('📨 Linear webhook received (mock):', event.type || 'unknown')
+  const eventType = req.headers['x-github-event']
   
-  // In production, this would handle real Linear webhooks
-  // For now, just acknowledge
-  res.json({ success: true, message: 'Linear webhook received (mock)' })
+  console.log(`📨 GitHub webhook received: ${eventType}`)
+  
+  let ticket: any = null
+  
+  // Handle Pull Request events
+  if (eventType === 'pull_request') {
+    const pr = event.pull_request
+    const action = event.action
+    
+    if (action === 'opened' || action === 'reopened') {
+      ticket = ticketSystem.createTicket({
+        title: `PR Review: ${pr.title}`,
+        description: pr.body || 'No description provided',
+        source: 'github_pr',
+        sourceId: `pr-${pr.number}`,
+        priority: 'medium',
+        metadata: {
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          author: pr.user.login,
+          repo: event.repository.full_name,
+          branch: pr.head.ref,
+          base: pr.base.ref,
+          action: action
+        }
+      })
+      
+      console.log(`🎫 Created ticket from PR #${pr.number}: ${pr.title}`)
+    }
+  }
+  
+  // Handle Issue events
+  else if (eventType === 'issues') {
+    const issue = event.issue
+    const action = event.action
+    
+    if (action === 'opened' || action === 'reopened') {
+      ticket = ticketSystem.createTicket({
+        title: `Issue: ${issue.title}`,
+        description: issue.body || 'No description provided',
+        source: 'github_issue',
+        sourceId: `issue-${issue.number}`,
+        priority: issue.labels?.some((l: any) => l.name.includes('bug')) ? 'high' : 'medium',
+        metadata: {
+          issueNumber: issue.number,
+          issueUrl: issue.html_url,
+          author: issue.user.login,
+          repo: event.repository.full_name,
+          labels: issue.labels,
+          action: action
+        }
+      })
+      
+      console.log(`🎫 Created ticket from Issue #${issue.number}: ${issue.title}`)
+    }
+  }
+  
+  // Broadcast new ticket to dashboard
+  if (ticket) {
+    broadcast({
+      type: 'ticket_created',
+      data: ticket
+    })
+  }
+  
+  res.json({ success: true, message: 'GitHub webhook processed' })
 })
 
-// Get real Linear issues
-app.get('/api/linear/issues', async (req, res) => {
+// Helper function to get current task from Gateway API
+
+
+// Helper functions for task/ticket context
+// TODO: Replace with real task tracking system
+
+
+// Linear approval endpoints
+app.get('/api/linear/approval-queue', async (req, res) => {
   try {
-    // Fetch from Linear API
-    const response = await fetch('https://api.linear.app/graphql', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': process.env.LINEAR_API_KEY || '',
-      },
-      body: JSON.stringify({
-        query: `
-          query {
-            issues(first: 10) {
-              nodes {
-                id
-                identifier
-                title
-                description
-                state {
-                  name
-                }
-                priority
-                assignee {
-                  name
-                  displayName
-                  avatarUrl
-                }
-                team {
-                  key
-                  name
-                }
-                createdAt
-                updatedAt
-              }
-            }
-          }
-        `,
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error(`Linear API error: ${response.status}`)
-    }
-
-    const data = await response.json()
+    const showAll = req.query.showAll === 'true'
     
-    if (data.errors) {
-      throw new Error(`Linear GraphQL errors: ${JSON.stringify(data.errors)}`)
+    // Use simple Linear integration (no mock data)
+    const { getLinearApprovalQueue } = await import('./linear-simple.js')
+    const result = await getLinearApprovalQueue(showAll)
+    
+    // If API failed, return 500 error so frontend can show useful message
+    if (!result.success) {
+      return res.status(500).json(result)
     }
-
-    const issues = data.data.issues.nodes.map((issue: any) => ({
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description || '',
-      status: issue.state.name,
-      priority: issue.priority,
-      assignee: issue.assignee ? {
-        name: issue.assignee.displayName || issue.assignee.name,
-        avatar: issue.assignee.avatarUrl,
-      } : null,
-      team: issue.team.key,
-      teamName: issue.team.name,
-      createdAt: issue.createdAt,
-      updatedAt: issue.updatedAt,
-    }))
-
-    // Filter to show only our foundational issues (ORA-5 through ORA-10)
-    const foundationalIssues = issues.filter((issue: any) => {
-      const issueNum = parseInt(issue.identifier.replace('ORA-', ''))
-      return issueNum >= 5 && issueNum <= 10
-    })
-
-    res.json({
-      success: true,
-      issues: foundationalIssues,
-      total: issues.length,
-    })
-
+    
+    res.json(result)
+    
   } catch (error: any) {
-    console.error('❌ Error fetching Linear issues:', error.message)
-    console.error('API Key present:', !!process.env.LINEAR_API_KEY)
-    
-    // Fallback to mock data if API fails
-    res.json({
+    console.error('Error fetching Linear approval queue:', error)
+    res.status(500).json({
       success: false,
-      message: `Using mock data - ${error.message}`,
-      issues: [
-        {
-          id: 'mock-1',
-          identifier: 'ORA-6',
-          title: 'Set up design system repository',
-          status: 'Todo',
-          assignee: {
-            name: 'Design System Platform Engineer',
-            avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=design-system',
-          },
-          team: 'ORA',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'mock-2',
-          identifier: 'ORA-7',
-          title: 'Implement engineering workflow',
-          status: 'Todo',
-          assignee: {
-            name: 'Documentation Specialist',
-            avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=documentation',
-          },
-          team: 'ORA',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'mock-3',
-          identifier: 'ORA-8',
-          title: 'Create HR Dashboard ↔ Linear integration',
-          status: 'Todo',
-          assignee: {
-            name: 'Head Engineer',
-            avatar: 'https://github.com/nimphius.png',
-          },
-          team: 'ORA',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'mock-4',
-          identifier: 'ORA-9',
-          title: 'Hire Business Analyst',
-          status: 'Todo',
-          assignee: {
-            name: 'Head Engineer',
-            avatar: 'https://github.com/nimphius.png',
-          },
-          team: 'ORA',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'mock-5',
-          identifier: 'ORA-10',
-          title: 'Set up QA testing framework',
-          status: 'Todo',
-          assignee: null,
-          team: 'ORA',
-          createdAt: new Date().toISOString(),
-        },
-      ],
+      error: error.message,
+      help: 'Check Linear API key configuration in .env file'
     })
   }
 })
 
+app.post('/api/linear/approve/:issueId', async (req, res) => {
+  try {
+    const { issueId } = req.params
+    const { comments, approvedBy = 'Nimphius', assigneeName } = req.body
+    const { identifier: requestIdentifier } = req.body
+    
+    console.log(`🔍 Processing approval for: ID=${issueId}, Identifier=${requestIdentifier}`)
+    
+    const { getIssueDetails, approveLinearIssue } = await import('./linear-simple.js')
+    
+    // Step 1: Check issue assignee from Linear (real API, fail-fast)
+    console.log(`   Checking issue assignee...`)
+    let issueDetails
+    try {
+      issueDetails = await getIssueDetails(issueId)
+    } catch (e: any) {
+      return res.status(502).json({
+        success: false,
+        error: 'Failed to fetch issue details from Linear API',
+        details: e.message
+      })
+    }
+    
+    // Step 2: If no assignee in Linear, require assigneeName or return NO_ASSIGNEE.
+    // assigneeName is used for local agent mapping (not setting Linear user — our
+    // OpenClaw agents aren't Linear workspace users).
+    const currentAssignee = issueDetails.assignee?.displayName || null
+    const effectiveAssignee = currentAssignee || assigneeName || null
+    
+    if (!currentAssignee && !assigneeName) {
+      console.log(`⚠️ Issue ${issueDetails.identifier} has no assignee. Requesting agent selection.`)
+      return res.status(400).json({
+        success: false,
+        code: 'NO_ASSIGNEE',
+        error: `Issue ${issueDetails.identifier} has no assignee — select an agent to continue.`,
+        issueId,
+        identifier: requestIdentifier || issueDetails.identifier
+      })
+    }
+    
+    // Step 3: Transition the issue in Linear (real API, fail-fast)
+    const linearResult = await approveLinearIssue(issueId, approvedBy, comments)
+    
+    if (!linearResult.success) {
+      console.error(`❌ Linear approval API failed:`, linearResult.error)
+      return res.status(500).json({
+        success: false,
+        error: linearResult.error,
+        help: linearResult.help || 'Check Linear API key and permissions.',
+        issueId,
+        identifier: requestIdentifier || issueDetails.identifier
+      })
+    }
+    
+    console.log(`✅ Linear issue ${linearResult.data.identifier} transitioned to ${linearResult.data.newState}`)
+    
+    // Step 4: Map assignee to agent and start agent
+    let agentId = null
+    if (effectiveAssignee) {
+      console.log(`🎯 Getting agent ID for assignee: ${effectiveAssignee}`)
+      agentId = getAgentIdFromLinearAssignee(effectiveAssignee)
+      console.log(`   Mapped to agent ID: ${agentId}`)
+      
+      if (agentId) {
+        // Attach agent label to Linear issue (creates the bridge for dashboard team view)
+        try {
+          const { attachAgentLabel } = await import('./linear-simple.js')
+          await attachAgentLabel(issueId, agentId)
+        } catch (labelError: any) {
+          // Non-fatal — dashboard will just show the issue as unassigned
+          console.warn(`⚠️ Failed to attach agent label: ${labelError.message}`)
+        }
+
+        const result = startAgentWithLinearIssue(agentId, {
+          identifier: requestIdentifier || issueDetails.identifier,
+          assignee: effectiveAssignee
+        })
+        
+        if (result.success) {
+          console.log(`✅ Agent ${agentId} started for Linear issue ${linearResult.data.identifier} (activation: ${result.activationId || 'unknown'})`)
+          
+          const ticket = ticketSystem.createTicket({
+            title: `Linear: ${linearResult.data.identifier}`,
+            description: 'Approved through Orange HR dashboard',
+            source: 'linear_issue',
+            sourceId: requestIdentifier || issueDetails.identifier,
+            priority: 'high',
+            metadata: {
+              linearId: issueId,
+              assignedAgent: agentId,
+              approvedBy,
+              comments
+            }
+          })
+          
+          broadcast({
+            type: 'ticket_created',
+            data: ticket
+          })
+        } else {
+          console.warn(`⚠️ Agent ${agentId} not started: ${result.error || 'unknown error'}`)
+        }
+      } else {
+        console.log(`⚠️ No agent mapping found for assignee: ${effectiveAssignee}`)
+      }
+    }
+    
+    // Step 5: Broadcast and respond
+    broadcast({
+      type: 'LINEAR_ISSUE_APPROVED',
+      issueId,
+      approvedBy,
+      timestamp: new Date().toISOString(),
+      comments,
+      source: 'linear-api',
+      agentId,
+      issueIdentifier: requestIdentifier || issueDetails.identifier
+    })
+    
+    res.json({
+      success: true,
+      issueId,
+      identifier: requestIdentifier || issueDetails.identifier,
+      agentId,
+      agentStarted: !!agentId,
+      linearState: linearResult.data.newState
+    })
+    
+  } catch (error: any) {
+    console.error('Error approving Linear issue:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+app.post('/api/linear/reject/:issueId', async (req, res) => {
+  try {
+    const { rejectIssue } = await import('./linear-approval-client.js')
+    const { issueId } = req.params
+    const { reason, rejectedBy = 'Nimphius' } = req.body
+    
+    if (!reason) {
+      return res.status(400).json({
+        success: false,
+        error: 'Reason is required for rejection'
+      })
+    }
+    
+    const result = await rejectIssue(issueId, rejectedBy, reason)
+    
+    if (result.success) {
+      // Broadcast rejection event
+      broadcast({
+        type: 'LINEAR_ISSUE_REJECTED',
+        issueId,
+        rejectedBy,
+        reason,
+        timestamp: new Date().toISOString()
+      })
+      
+      res.json(result)
+    } else {
+      res.status(400).json(result)
+    }
+    
+  } catch (error: any) {
+    console.error('Error rejecting Linear issue:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+app.post('/api/linear/request-changes/:issueId', async (req, res) => {
+  try {
+    const { requestChanges } = await import('./linear-approval-client.js')
+    const { issueId } = req.params
+    const { changes, requestedBy = 'Nimphius' } = req.body
+    
+    if (!changes) {
+      return res.status(400).json({
+        success: false,
+        error: 'Changes description is required'
+      })
+    }
+    
+    const result = await requestChanges(issueId, requestedBy, changes)
+    
+    if (result.success) {
+      // Broadcast changes requested event
+      broadcast({
+        type: 'LINEAR_ISSUE_CHANGES_REQUESTED',
+        issueId,
+        requestedBy,
+        changes,
+        timestamp: new Date().toISOString()
+      })
+      
+      res.json(result)
+    } else {
+      res.status(400).json(result)
+    }
+    
+  } catch (error: any) {
+    console.error('Error requesting changes on Linear issue:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+// Agent creation endpoint
+app.post('/api/create-agent', async (req, res) => {
+  try {
+    const { name, role, emoji, department, skills, experience, qualifications } = req.body
+    
+    if (!name || !role) {
+      return res.status(400).json({
+        success: false,
+        error: 'Name and role are required'
+      })
+    }
+    
+    console.log(`🧱 Creating new agent: ${name} (${role})`)
+    
+    // 1. Submit to Gateway API
+    const gatewayResponse = await fetch(`${GATEWAY_URL}/api/v1/agent-requests`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': 'orange-hr-gateway-2026'
+      },
+      body: JSON.stringify({
+        name,
+        role,
+        department: department || 'Engineering',
+        skills: Array.isArray(skills) ? skills : [skills],
+        experience: experience || '',
+        qualifications: qualifications || '',
+        submittedBy: 'HR Dashboard',
+        status: 'PENDING'
+      })
+    })
+    
+    const gatewayData = await gatewayResponse.json()
+    
+    if (!gatewayData.success) {
+      return res.status(500).json({
+        success: false,
+        error: `Gateway submission failed: ${gatewayData.error}`
+      })
+    }
+    
+    const gatewayAgent = gatewayData.data
+    console.log(`✅ Gateway submission successful: ${gatewayAgent.id}`)
+    
+    // 2. Create OpenClaw agent
+    const agentId = name.toLowerCase().replace(/[^a-z0-9]/g, '-')
+    const workspacePath = `/Users/openclaw/projects/${agentId}`
+    
+    // Create workspace directory
+    const fs = require('fs')
+    const path = require('path')
+    
+    if (!fs.existsSync(workspacePath)) {
+      fs.mkdirSync(workspacePath, { recursive: true })
+      console.log(`📁 Created workspace: ${workspacePath}`)
+    }
+    
+    // Create OpenClaw agent using execSync
+    const { execSync } = require('child_process')
+    
+    try {
+      // Create agent
+      execSync(`openclaw agents add ${agentId} --workspace ${workspacePath}`, { stdio: 'pipe' })
+      console.log(`✅ OpenClaw agent created: ${agentId}`)
+      
+      // Set identity
+      execSync(`openclaw agents set-identity --agent ${agentId} --name "${name}" --emoji "${emoji || '🧑‍💻'}"`, { stdio: 'pipe' })
+      console.log(`✅ Identity set: ${name} ${emoji}`)
+      
+      // Create IDENTITY.md
+      const identityContent = `# IDENTITY.md - ${name}
+
+- **Name:** ${name}
+- **Emoji:** ${emoji || '🧑‍💻'}
+- **Workspace:** ${workspacePath}
+- **Created:** ${new Date().toISOString().split('T')[0]} via Orange HR Dashboard
+- **Approved by:** HR Dashboard
+
+---
+
+**Role:** ${role}
+**Department:** ${department || 'Engineering'}
+**Status:** ACTIVE
+**Next:** Awaiting task assignment
+`
+      
+      fs.writeFileSync(path.join(workspacePath, 'IDENTITY.md'), identityContent)
+      console.log(`📄 Created IDENTITY.md`)
+      
+    } catch (execError: any) {
+      console.error(`❌ OpenClaw agent creation failed:`, execError.message)
+      // Continue anyway - at least Gateway submission succeeded
+    }
+    
+    // 3. Auto-approve in Gateway (for demo - in production would wait for manual approval)
+    try {
+      const approveResponse = await fetch(`${GATEWAY_URL}/api/v1/agent-requests/${gatewayAgent.id}/approve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': 'orange-hr-gateway-2026'
+        },
+        body: JSON.stringify({
+          approvedBy: 'HR Dashboard'
+        })
+      })
+      
+      const approveData = await approveResponse.json()
+      
+      if (approveData.success) {
+        console.log(`✅ Gateway approval successful`)
+      }
+      
+    } catch (approveError: any) {
+      console.error(`❌ Gateway approval failed:`, approveError.message)
+    }
+    
+    // 4. Send webhook to dashboard for real-time update
+    broadcast({
+      type: 'AGENT_CREATED',
+      agentId: gatewayAgent.id,
+      openclawAgentId: agentId,
+      name,
+      role,
+      emoji: emoji || '🧑‍💻',
+      timestamp: new Date().toISOString()
+    })
+    
+    res.json({
+      success: true,
+      data: {
+        gatewayId: gatewayAgent.id,
+        openclawId: agentId,
+        name,
+        role,
+        workspace: workspacePath
+      },
+      message: 'Agent created successfully'
+    })
+    
+  } catch (error: any) {
+    console.error('Agent creation error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+// Ticket Management API Endpoints
+
+// Get all tickets
+app.get('/api/tickets', (req, res) => {
+  try {
+    const { status, assignedTo } = req.query
+    const tickets = ticketSystem.getTickets({
+      status: status as any,
+      assignedTo: assignedTo as string
+    })
+    
+    res.json({
+      success: true,
+      data: tickets,
+      count: tickets.length,
+      stats: ticketSystem.getStats()
+    })
+  } catch (error: any) {
+    console.error('Error getting tickets:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Get single ticket
+app.get('/api/tickets/:id', (req, res) => {
+  try {
+    const ticket = ticketSystem.getTicket(req.params.id)
+    
+    if (!ticket) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' })
+    }
+    
+    res.json({ success: true, data: ticket })
+  } catch (error: any) {
+    console.error('Error getting ticket:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Assign ticket to agent
+app.post('/api/tickets/:id/assign', async (req, res) => {
+  try {
+    const { agentId } = req.body
+    
+    if (!agentId) {
+      return res.status(400).json({ success: false, error: 'agentId is required' })
+    }
+    
+    const ticket = ticketSystem.assignTicket(req.params.id, agentId)
+    
+    if (!ticket) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' })
+    }
+    
+    // Start agent with ticket context
+    const { execSync } = require('child_process')
+    const command = `openclaw --agent ${agentId} "Ticket #${ticket.id}: ${ticket.title}\n\nDescription: ${ticket.description}\n\nSource: ${ticket.source} ${ticket.sourceId}\nPriority: ${ticket.priority}\n\nPlease review and begin work."`
+    
+    try {
+      execSync(command, { stdio: 'pipe' })
+      console.log(`🚀 Started agent ${agentId} with ticket ${ticket.id}`)
+      
+      // Broadcast assignment
+      broadcast({
+        type: 'ticket_assigned',
+        data: ticket
+      })
+      
+      res.json({
+        success: true,
+        data: ticket,
+        message: `Ticket assigned to ${agentId} and agent started`
+      })
+      
+    } catch (execError: any) {
+      console.error(`Failed to start agent ${agentId}:`, execError.message)
+      
+      // Still mark as assigned even if agent start failed
+      res.json({
+        success: true,
+        data: ticket,
+        warning: `Ticket assigned to ${agentId} but agent failed to start: ${execError.message}`
+      })
+    }
+    
+  } catch (error: any) {
+    console.error('Error assigning ticket:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Update ticket status
+app.put('/api/tickets/:id/status', (req, res) => {
+  try {
+    const { status } = req.body
+    
+    if (!status || !['new', 'assigned', 'in_progress', 'done', 'blocked'].includes(status)) {
+      return res.status(400).json({ success: false, error: 'Valid status is required' })
+    }
+    
+    const ticket = ticketSystem.updateTicketStatus(req.params.id, status as any)
+    
+    if (!ticket) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' })
+    }
+    
+    // Broadcast status update
+    broadcast({
+      type: 'ticket_status_updated',
+      data: ticket
+    })
+    
+    res.json({ success: true, data: ticket })
+  } catch (error: any) {
+    console.error('Error updating ticket status:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+// Delete ticket
+app.delete('/api/tickets/:id', (req, res) => {
+  try {
+    const deleted = ticketSystem.deleteTicket(req.params.id)
+    
+    if (!deleted) {
+      return res.status(404).json({ success: false, error: 'Ticket not found' })
+    }
+    
+    // Broadcast deletion
+    broadcast({
+      type: 'ticket_deleted',
+      data: { id: req.params.id }
+    })
+    
+    res.json({ success: true, message: 'Ticket deleted' })
+  } catch (error: any) {
+    console.error('Error deleting ticket:', error)
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+/**
+ * Human-readable relative time helper.
+ */
+function timeAgo(dateStr: string): string {
+  const now = Date.now()
+  const then = new Date(dateStr).getTime()
+  const diffMs = now - then
+  const diffMins = Math.floor(diffMs / 60000)
+  if (diffMins < 1) return 'just now'
+  if (diffMins < 60) return `${diffMins}m ago`
+  const diffHours = Math.floor(diffMins / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+  const diffDays = Math.floor(diffHours / 24)
+  if (diffDays < 7) return `${diffDays}d ago`
+  return new Date(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 HR Dashboard API running on http://localhost:${PORT}`)
-  console.log(`📡 WebSocket server running on ws://localhost:3004`)
-  console.log(`🔗 Orange HR webhook: POST http://localhost:${PORT}/webhook/orange-hr`)
-  console.log(`🔗 Linear webhook: POST http://localhost:${PORT}/webhook/linear`)
+  console.log(`🚀 HR Dashboard Proxy running on port ${PORT}`)
+  console.log(`📡 WebSocket server on port 3004`)
+  console.log(`🔗 Connected to Gateway API: ${GATEWAY_URL}`)
+  console.log(`🔗 Health check: GET http://localhost:${PORT}/health`)
+  console.log(`🔗 Dashboard data: GET http://localhost:${PORT}/api/dashboard`)
+  console.log(`🔗 Create agent: POST http://localhost:${PORT}/api/create-agent`)
+  
+  // Connect to Gateway WebSocket
+  connectToGatewayWebSocket()
 })
