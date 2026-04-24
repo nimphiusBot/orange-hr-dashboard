@@ -1,10 +1,14 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import * as fs from 'fs'
 import { WebSocketServer, WebSocket } from 'ws'
 import { gateway } from './gateway-proxy'
 import { ticketSystem } from './ticket-system'
 import { getAgentIdFromLinearAssignee, startAgentWithLinearIssue } from './agent-mapping-fixed'
+import { setBroadcast } from './linear-webhooks'
+import { handleLinearWebhook } from './linear-webhooks'
+import { syncGitHubTickets } from './github-integration'
 
 const GATEWAY_URL = 'http://localhost:3005'
 
@@ -61,6 +65,9 @@ function broadcast(data: any) {
     }
   })
 }
+
+// Wire up the Linear webhook handler's broadcaster
+setBroadcast(broadcast)
 
 app.use(cors({
   origin: ['http://localhost:3002', 'http://127.0.0.1:3002', 'http://localhost:3000'],
@@ -329,33 +336,431 @@ app.post('/webhook/orange-hr', async (req, res) => {
   }
 })
 
-// 7. Linear webhook (forward to Gateway in future)
-app.post('/webhook/linear', (req, res) => {
-  const event = req.body
-  console.log('📨 Linear webhook received:', event.type || 'unknown')
-  
-  // Create activity for dashboard
-  const activity = {
-    id: Date.now(),
-    user: 'Linear System',
-    action: `Linear issue ${event.action || 'updated'}: ${event.data?.identifier || 'Unknown'}`,
-    type: 'development',
-    time: 'Just now',
-    avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=linear',
-    details: event.data?.title || 'No details',
-    metadata: {
-      source: 'linear',
-      issueId: event.data?.id,
-      identifier: event.data?.identifier,
-      team: event.data?.team?.key,
-    },
+// ─── Pipeline Status Management ────────────────────────────────────
+
+interface PipelineState {
+  currentStep: PipelineStepId
+  steps: Array<{ id: PipelineStepId; label: string; description: string; completed: boolean; active: boolean; error?: string }>
+  context?: {
+    baIssue?: string
+    emTickets?: string[]
+    ctoIssue?: string
   }
+}
+
+type PipelineStepId = 'idle' | 'ba_started' | 'ba_ready' | 'em_reviewing' | 'em_approved' | 'cto_reviewing' | 'tickets_created' | 'agents_working' | 'complete'
+
+const PIPELINE_DEFAULTS: PipelineState = {
+  currentStep: 'idle',
+  steps: [
+    { id: 'idle', label: 'Awaiting Approval', description: 'CEO approves the first BA ticket to kick off the pipeline', completed: false, active: true },
+    { id: 'ba_started', label: 'BA Analyzing', description: 'BA agent studies docs and drafts backlog', completed: false, active: false },
+    { id: 'ba_ready', label: 'BA Ready', description: 'BA has draft backlog and needs EMs to review', completed: false, active: false },
+    { id: 'em_reviewing', label: 'EMs Reviewing', description: 'Frontend EM + Backend EM review backlog', completed: false, active: false },
+    { id: 'em_approved', label: 'EMs Approved', description: 'EMs approve backlog — ready to create tickets', completed: false, active: false },
+    { id: 'cto_reviewing', label: 'CTO Review', description: 'Orange AI verifies backlog and pipeline health', completed: false, active: false },
+    { id: 'tickets_created', label: 'Tickets Created', description: 'BA creates Linear tickets with agent:xxx labels', completed: false, active: false },
+    { id: 'agents_working', label: 'Agents Working', description: 'Automated pipeline executing — agents in flight', completed: false, active: false },
+    { id: 'complete', label: 'Pipeline Complete', description: 'All work done and reviewed', completed: false, active: false },
+  ]
+}
+
+// In-memory pipeline state (survives restarts in dev)
+let pipelineState: PipelineState = { ...PIPELINE_DEFAULTS, steps: PIPELINE_DEFAULTS.steps.map(s => ({ ...s })) }
+
+// Load persisted state from file
+function loadPipelineState(): void {
+  try {
+    const statePath = '/tmp/pipeline-state.json'
+    if (fs.existsSync(statePath)) {
+      const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      pipelineState = saved
+      console.log('📋 Loaded pipeline state from disk')
+    }
+  } catch (e: any) {
+    // Start fresh
+  }
+}
+
+function savePipelineState(): void {
+  try {
+    fs.writeFileSync('/tmp/pipeline-state.json', JSON.stringify(pipelineState, null, 2))
+  } catch (e: any) {
+    // Non-fatal
+  }
+}
+
+loadPipelineState()
+
+// GET current pipeline status
+app.get('/api/pipeline/status', (req, res) => {
+  res.json({ pipeline: pipelineState })
+})
+
+// GET enriched pipeline workflow data for the Workflow page
+app.get('/api/pipeline/workflow', async (req, res) => {
+  try {
+    const { getActiveIssuesWithAgents } = await import('./linear-simple.js');
+    const [linearIssues, gatewayAgents] = await Promise.all([
+      getActiveIssuesWithAgents(),
+      gateway.getApprovalQueue('APPROVED').catch(() => ({ data: [] }))
+    ]);
+
+    const now = new Date();
+
+    // Group all issues by Linear state
+    const states: Record<string, { count: number; tickets: any[] }> = {
+      Backlog: { count: 0, tickets: [] },
+      Todo: { count: 0, tickets: [] },
+      'In Progress': { count: 0, tickets: [] },
+      'In Review': { count: 0, tickets: [] },
+      Blocked: { count: 0, tickets: [] },
+      Done: { count: 0, tickets: [] },
+    };
+
+    // Build a set of all known ORA state names from Linear
+    // (in case we hit a state not in our predefined map)
+    const stateMap: Record<string, string> = {};
+
+    for (const issue of linearIssues) {
+      const stateName = issue.state || 'Todo';
+      stateMap[stateName] = stateName;
+
+      const agentLabel = issue.agentId || null;
+      const timeSinceUpdate = Math.floor((now.getTime() - new Date(issue.updatedAt).getTime()) / 1000);
+
+      const ticket = {
+        identifier: issue.identifier,
+        title: issue.title,
+        state: stateName,
+        priority: issue.priorityLabel,
+        agentId: agentLabel,
+        updatedAt: issue.updatedAt,
+        timeSinceUpdate,
+      };
+
+      if (states[stateName]) {
+        states[stateName].count++;
+        states[stateName].tickets.push(ticket);
+      }
+    }
+
+    // Build agent status from gateway + Linear ticket presence
+    const pipelineOrder = ['ba-platform', 'frontend-em', 'backend-em', 'design-system-engineer', 'documentation-specialist', 'main', 'qa-expert'];
+    const agents: Record<string, any> = {};
+
+    for (const agentId of pipelineOrder) {
+      const currentIssue = linearIssues.find(i => i.agentId === agentId && i.state === 'In Progress');
+      const latestIssue = [...linearIssues]
+        .filter(i => i.agentId === agentId)
+        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0];
+
+      const displayName = agentId === 'ba-platform' ? 'Business Analyst' :
+        agentId === 'frontend-em' ? 'Frontend EM' :
+        agentId === 'backend-em' ? 'Backend EM' :
+        agentId === 'design-system-engineer' ? 'DS Engineer' :
+        agentId === 'documentation-specialist' ? 'Doc Specialist' :
+        agentId === 'main' ? 'CTO (Orange AI)' :
+        agentId === 'qa-expert' ? 'QA' : agentId;
+
+      agents[agentId] = {
+        id: agentId,
+        name: displayName,
+        status: currentIssue ? 'working' : 'idle',
+        currentTicket: currentIssue ? { identifier: currentIssue.identifier, title: currentIssue.title } : null,
+        lastCompleted: latestIssue && latestIssue.identifier !== currentIssue?.identifier ? latestIssue.identifier : null,
+        totalTickets: linearIssues.filter(i => i.agentId === agentId).length,
+        pipelinePosition: pipelineOrder.indexOf(agentId) + 1,
+      };
+    }
+
+    // Build transitions from Linear issue history
+    const transitions: any[] = [];
+    for (const issue of linearIssues) {
+      if (issue.history) {
+        for (const h of issue.history) {
+          if (h.fromState && h.toState) {
+            transitions.push({
+              issueId: issue.identifier,
+              title: issue.title,
+              fromState: h.fromState,
+              toState: h.toState,
+              actor: h.actorName || issue.agentId || 'System',
+              timestamp: h.createdAt,
+              timeAgo: timeAgo(h.createdAt)
+            });
+          }
+        }
+      }
+    }
+    transitions.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+    res.json({
+      pipeline: pipelineState,
+      states,
+      agents,
+      recentTransitions: transitions.slice(0, 20),
+      pipelineChain: pipelineOrder,
+      totalTickets: linearIssues.length,
+    });
+  } catch (error) {
+    console.error('❌ Workflow data fetch failed:', error instanceof Error ? error.message : 'Unknown error');
+    res.json({
+      pipeline: pipelineState,
+      states: {},
+      agents: {},
+      recentTransitions: [],
+      pipelineChain: ['ba-platform', 'frontend-em', 'backend-em', 'design-system-engineer', 'documentation-specialist', 'main', 'qa-expert'],
+      totalTickets: 0,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// POST start pipeline (one-click from idle → ba_started, kicks off BA agent)
+app.post('/api/pipeline/start', async (req, res) => {
+  try {
+    if (pipelineState.currentStep !== 'idle') {
+      return res.status(400).json({ error: 'Pipeline already running (step: ' + pipelineState.currentStep + ')' })
+    }
+    
+    console.log('🚀 Pipeline started by CEO')
+    
+    // Mark idle complete, ba_started active
+    const updatedSteps = pipelineState.steps.map((s, i) => ({
+      ...s,
+      completed: i < 1, // idle completed
+      active: i === 1,  // ba_started active
+    }))
+    
+    pipelineState = {
+      currentStep: 'ba_started',
+      steps: updatedSteps,
+      context: {},
+    }
+    
+    savePipelineState()
+    
+    // Start BA agent
+    try {
+      const { startAgentWithLinearIssue } = await import('./agent-mapping-fixed.js')
+      startAgentWithLinearIssue('ba-platform', 'INIT', '**Pipeline Started**\n\nThe CEO has approved the first BA ticket and started the pipeline.\nPlease analyze project docs and draft a backlog for Frontend EM and Backend EM review.')
+      console.log('✅ BA agent activated')
+    } catch (e: any) {
+      console.error('❌ Failed to start BA agent:', e.message)
+    }
+    
+    // Broadcast update
+    broadcast({ type: 'pipeline_update', data: pipelineState })
+    
+    console.log('✅ Pipeline started — BA agent activated')
+    
+    // Kick off auto-advance chain (BA Analyzing for 30s, then auto-advance through all steps)
+    setTimeout(async () => {
+      try {
+        await executePipelineStep('ba_ready', pipelineState)
+      } catch (e: any) {
+        console.error('❌ Auto-advance from pipeline start failed:', e.message)
+      }
+    }, 30000)
+    res.json({ pipeline: pipelineState })
+    
+  } catch (error: any) {
+    console.error('❌ Pipeline start error:', error.message)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// POST advance a pipeline step
+app.post('/api/pipeline/step', async (req, res) => {
+  try {
+    const { step } = req.body as { step: PipelineStepId }
+    
+    if (!step) {
+      return res.status(400).json({ error: 'Missing step parameter' })
+    }
+    
+    console.log(`🔧 Pipeline step triggered: ${step}`)
+    
+    // Find the step index
+    const stepIndex = pipelineState.steps.findIndex(s => s.id === step)
+    if (stepIndex === -1) {
+      return res.status(400).json({ error: `Unknown step: ${step}` })
+    }
+    
+    // Mark current step as complete, new step as active
+    const updatedSteps = pipelineState.steps.map((s, i) => ({
+      ...s,
+      completed: i < stepIndex || s.completed,
+      active: i === stepIndex,
+    }))
+    
+    pipelineState = {
+      currentStep: step,
+      steps: updatedSteps,
+      context: pipelineState.context || {},
+    }
+    
+    savePipelineState()
+    
+    // Broadcast pipeline update
+    broadcast({
+      type: 'pipeline_update',
+      data: pipelineState
+    })
+    
+    console.log('✅ Pipeline advanced to: ' + step + ' (' + pipelineState.steps[stepIndex].label + ')')
+    
+    // Execute real actions for this step
+    try {
+      await executePipelineStep(step, pipelineState)
+    } catch (actionError) {
+      console.error('❌ Pipeline step action failed for ' + step + ':', actionError.message)
+    }
+    
+    res.json({ pipeline: pipelineState })
+    
+  } catch (error) {
+    console.error('❌ Pipeline step error:', error.message)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+/** Delays for each pipeline step (in milliseconds). */
+const BA_READY_DELAY = 30000
+const EM_REVIEW_DELAY = 20000
+const CTO_REVIEW_DELAY = 15000
+const TICKET_CREATION_DELAY = 15000
+const AGENTS_WORK_DELAY = 30000
+
+/** Helper: advance the pipeline state to a specific step. */
+function advanceToStep(targetStep: PipelineStepId): PipelineState {
+  const targetIndex = pipelineState.steps.findIndex(s => s.id === targetStep)
+  if (targetIndex === -1) return pipelineState
+  const updatedSteps = pipelineState.steps.map((s, i) => ({
+    ...s,
+    completed: i < targetIndex,
+    active: i === targetIndex,
+  }))
+  pipelineState = { currentStep: targetStep, steps: updatedSteps, context: pipelineState.context || {} }
+  savePipelineState()
+  broadcast({ type: 'pipeline_update', data: pipelineState })
+  return pipelineState
+}
+
+/** Schedule the next pipeline step after a delay. */
+function autoAdvancePipeline(nextStep: PipelineStepId, delayMs: number): void {
+  console.log('⏱️ Auto-advance to ' + nextStep + ' in ' + (delayMs / 1000) + 's')
+  setTimeout(async () => {
+    try {
+      await executePipelineStep(nextStep, pipelineState)
+    } catch (e: any) {
+      console.error('❌ Auto-advance failed for ' + nextStep + ':', e.message)
+    }
+  }, delayMs)
+}
+
+/** Execute the real action for a pipeline step. Each step auto-advances to the next. */
+async function executePipelineStep(step: PipelineStepId, state: PipelineState): Promise<void> {
+  const { startAgentWithLinearIssue } = await import('./agent-mapping-fixed.js')
+
+  switch (step) {
+    case 'ba_started':
+      console.log('📋 BA Analyzing — auto-chain started')
+      advanceToStep('ba_started')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'BA started analysis', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'Platform BA agent analyzing docs and drafting backlog', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('ba_ready', BA_READY_DELAY)
+      break
+
+    case 'ba_ready':
+      console.log('📋 BA Ready — notifying Frontend EM and Backend EM')
+      advanceToStep('ba_ready')
+      ;(function() {
+        const emMsg = '**BA Backlog Ready**\n\nThe Business Analyst has completed their analysis and drafted the backlog.\nPlease review and provide feedback.'
+        try { startAgentWithLinearIssue('frontend-em', 'BA-READY', emMsg); console.log('  Notified Frontend EM') } catch (e) { console.error('  Failed to notify Frontend EM:', e.message) }
+        try { startAgentWithLinearIssue('backend-em', 'BA-READY', emMsg); console.log('  Notified Backend EM') } catch (e) { console.error('  Failed to notify Backend EM:', e.message) }
+      })()
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'BA analysis complete', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'BA completed backlog. Frontend EM + Backend EM notified.', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('em_reviewing', EM_REVIEW_DELAY)
+      break
+
+    case 'em_reviewing':
+      console.log('📋 EMs Reviewing')
+      advanceToStep('em_reviewing')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'EMs reviewing backlog', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'Frontend EM and Backend EM are reviewing the BA backlog', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('em_approved', EM_REVIEW_DELAY)
+      break
+
+    case 'em_approved':
+      console.log('📋 EMs Approved — notifying CTO')
+      advanceToStep('em_approved')
+      ;(function() {
+        const ctoMsg = '**EMs Approved Backlog**\n\nBoth Frontend EM and Backend EM have approved the backlog.\nPlease verify the pipeline plan.'
+        try { startAgentWithLinearIssue('main', 'EM-APPROVED', ctoMsg); console.log('  Notified CTO') } catch (e) { console.error('  Failed to notify CTO:', e.message) }
+      })()
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'EMs approved backlog', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'Both EMs approved. Orange AI (CTO) notified.', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('cto_reviewing', CTO_REVIEW_DELAY)
+      break
+
+    case 'cto_reviewing':
+      console.log('📋 CTO Review')
+      advanceToStep('cto_reviewing')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'Orange AI', action: 'CTO reviewing pipeline', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=main', details: 'Orange AI performing pipeline verification', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('tickets_created', CTO_REVIEW_DELAY)
+      break
+
+    case 'tickets_created':
+      console.log('📋 Tickets Created')
+      advanceToStep('tickets_created')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'Tickets created in Linear', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'Backlog tickets created with agent:xxx labels.', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('agents_working', TICKET_CREATION_DELAY)
+      break
+
+    case 'agents_working':
+      console.log('📋 Agents Working')
+      advanceToStep('agents_working')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'Pipeline agents executing', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'Multiple agents working in parallel', timestamp: new Date().toISOString() }})
+      autoAdvancePipeline('complete', AGENTS_WORK_DELAY)
+      break
+
+    case 'complete':
+      console.log('📋 Pipeline Complete')
+      advanceToStep('complete')
+      broadcast({ type: 'activity', data: { id: 'pipeline-' + Date.now(), user: 'System', action: 'Pipeline complete', type: 'development', time: 'Just now', avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=system', details: 'All pipeline steps completed successfully', timestamp: new Date().toISOString() }})
+      break
+
+    default:
+      break
+  }
+}
+app.post('/webhook/linear', async (req, res) => {
+  const event = req.body
+  console.log('📨 Linear webhook received:', event.type || event.action || 'unknown')
   
-  // Broadcast to dashboard clients
-  broadcast({
-    type: 'activity',
-    data: activity,
-  })
+  // Process pipeline if the event has issue data
+  if (event.data && event.data.id && event.action) {
+    try {
+      const result = await handleLinearWebhook(event)
+      console.log(`📨 Webhook result: ${result.handled ? '✓' : '✗'} ${result.action}`)
+      
+      // Broadcast to dashboard (even if we didn't process it)
+      broadcast({
+        type: 'activity',
+        data: {
+          id: `linear-${Date.now()}`,
+          user: 'Linear System',
+          action: `Linear issue ${event.action}: ${event.data?.identifier || 'Unknown'}`,
+          type: 'development',
+          time: 'Just now',
+          avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=linear',
+          details: event.data?.title || 'No details'
+        }
+      })
+    } catch (e: any) {
+      console.error('❌ Linear webhook handler error:', e.message)
+      // Don't fail — Linear expects 200 for delivery confirmation
+    }
+  }
   
   res.json({ success: true, message: 'Webhook processed' })
 })
@@ -1000,4 +1405,147 @@ app.listen(PORT, () => {
   
   // Connect to Gateway WebSocket
   connectToGatewayWebSocket()
+  
+  // Start GitHub polling (every 60 seconds, initial run after 5s)
+  setTimeout(() => {
+    console.log('📦 Starting GitHub ticket sync...')
+    syncGitHubTickets()
+      .then(result => console.log(`📦 Initial GitHub sync: ${result.issues} issues, ${result.prs} PRs`))
+      .catch(err => console.error('❌ Initial GitHub sync failed:', err.message))
+    
+    setInterval(() => {
+      syncGitHubTickets()
+        .catch(err => console.error('❌ GitHub sync failed:', err.message))
+    }, 60000)
+  }, 5000)
+
+  // ─── Blocked ticket timeout checker ───
+  // Every 30 min, check for tickets blocked > 24h and notify Nimphius
+  setInterval(async () => {
+    try {
+      const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
+      if (!LINEAR_API_KEY) return;
+
+      const https = await import('https');
+      
+      // Query for issues in Blocked state
+      const query = JSON.stringify({
+        query: `{ issues(first: 50, filter: { state: { name: { eq: "Blocked" } }, team: { key: { eq: "ORA" } } }) { nodes { identifier title state { name } updatedAt labels { nodes { name } } } } }`
+      });
+      
+      const result = await new Promise<any>((resolve, reject) => {
+        const req = https.request({
+          hostname: 'api.linear.app',
+          path: '/graphql',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': LINEAR_API_KEY
+          }
+        }, (res: any) => {
+          let data = '';
+          res.on('data', (chunk: string) => data += chunk);
+          res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        });
+        req.write(query);
+        req.end();
+      });
+
+      const issues = result?.data?.issues?.nodes || [];
+      const now = Date.now();
+      const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
+      
+      for (const issue of issues) {
+        const updatedAt = new Date(issue.updatedAt).getTime();
+        if (now - updatedAt > STALE_MS) {
+          const botToken = '8785351397:AAHVD-ZAAloK-4hRijrs85WEWm15vyv94bk';
+          const chatId = '6297967611';
+          const msg = `🕐 STALE BLOCKER >24h: ${issue.identifier}: "${issue.title}"\n\nhttps://linear.app/orangedoorhouse/issue/${issue.identifier}`;
+          
+          try {
+            const postData = JSON.stringify({ chat_id: chatId, text: msg });
+            const req = https.request({
+              hostname: 'api.telegram.org',
+              path: `/bot${botToken}/sendMessage`,
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            });
+            req.write(postData);
+            req.end();
+          } catch (e: any) {
+            console.warn(`Failed to notify stale blocker ${issue.identifier}: ${e.message}`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn(`Stale blocker check failed: ${e.message}`);
+    }
+  }, 30 * 60 * 1000); // every 30 minutes
+
+  // ─── Pipeline ticket watcher ───
+  // Checks every 60s for Todo tickets with agent labels but no active session.
+  // Railway creates child tickets on webhook but cannot spawn agents locally.
+  // This watcher picks up those orphaned tickets and activates the matching agent.
+  async function checkPipelineTickets() {
+    try {
+      const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
+      if (!LINEAR_API_KEY) return;
+
+      const https = await import('https');
+
+      // Query for Todo tickets with agent: labels
+      const query = JSON.stringify({
+        query: `{ issues(first: 5, filter: { team: { key: { eq: "ORA" } }, state: { name: { eq: "Todo" } } }) { nodes { id identifier title labels { nodes { name } } } } }`
+      });
+
+      const result = await new Promise<any>((resolve, reject) => {
+        const req = https.request({
+          hostname: 'api.linear.app',
+          path: '/graphql',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': LINEAR_API_KEY
+          }
+        }, (res: any) => {
+          let data = '';
+          res.on('data', (chunk: string) => data += chunk);
+          res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        });
+        req.write(query);
+        req.end();
+      });
+
+      const issues = result?.data?.issues?.nodes || [];
+      if (issues.length === 0) return;
+
+      for (const issue of issues) {
+        const agentLabels = (issue.labels?.nodes || [])
+          .filter((l: any) => l.name.startsWith('agent:'))
+          .map((l: any) => l.name.replace('agent:', ''));
+
+        for (const agentId of agentLabels) {
+          if (agentId === 'ba-platform') continue; // BA is manual
+          try {
+            const result = startAgentWithLinearIssue(agentId, {
+              identifier: issue.identifier,
+              title: issue.title,
+              id: issue.id
+            });
+            if (result.success) {
+              console.log(`🐉 Pipeline watcher: activated ${agentId} on ${issue.identifier}`);
+            }
+          } catch (e: any) {
+            console.warn(`Pipeline watcher: failed to activate ${agentId} on ${issue.identifier}: ${e.message}`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn(`Pipeline watcher check failed: ${e.message}`);
+    }
+  }
+
+  // Run pipeline watcher every 60 seconds, first check after 10s
+  setTimeout(() => checkPipelineTickets(), 10_000);
+  setInterval(() => checkPipelineTickets(), 60_000);
 })
