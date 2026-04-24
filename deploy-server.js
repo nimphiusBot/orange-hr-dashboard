@@ -4,17 +4,17 @@
  * Deployable server for HR Dashboard backend.
  * Railway entry point — full pipeline auto-advance included.
  *
- * Inlines all pipeline logic so no .ts imports are needed.
+ * CJS-compatible (no "type": "module" needed in package.json).
  */
 
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import * as https from 'https';
-import * as http from 'http';
-import * as fs from 'fs';
-import { spawn } from 'child_process';
-import { WebSocketServer, WebSocket } from 'ws';
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const { WebSocketServer, WebSocket } = require('ws');
 
 // ─── Constants ───
 const LINEAR_API_KEY = process.env.LINEAR_API_KEY || '';
@@ -60,35 +60,35 @@ function extractAgentFromLabels(labels) {
 }
 
 // ─── Linear API helpers ───
-function graphql(query, variables = {}) {
+function graphql(query) {
   return fetch(LINEAR_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': LINEAR_API_KEY },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query }),
   }).then(r => r.json());
 }
 
 async function findTeamByKey(key) {
   const d = await graphql(`{ teams(filter: { key: { eq: "${key}" } }) { nodes { id name } } }`);
-  const team = d.data.teams.nodes[0];
+  const team = d.data && d.data.teams && d.data.teams.nodes[0];
   if (!team) throw new Error(`Team ${key} not found`);
   return team;
 }
 
 async function findWorkflowState(teamId, stateName) {
   const d = await graphql(`{ workflowStates(filter: { team: { id: { eq: "${teamId}" } } }) { nodes { id name } } }`);
-  const state = d.data.workflowStates.nodes.find(s => s.name === stateName);
+  const state = d.data && d.data.workflowStates && d.data.workflowStates.nodes.find(s => s.name === stateName);
   if (!state) throw new Error(`State "${stateName}" not found for team`);
   return state.id;
 }
 
 async function getIssueTeamId(issueId) {
   const d = await graphql(`{ issue(id: "${issueId}") { team { id } } }`);
-  if (!d.data.issue) throw new Error(`Issue ${issueId} not found`);
+  if (!d.data || !d.data.issue) throw new Error(`Issue ${issueId} not found`);
   return d.data.issue.team.id;
 }
 
-async function createLinearIssue({ title, description, teamId, priority, parentId, labelIds }) {
+async function createLinearIssue({ title, description, teamId, priority, parentId }) {
   const mutation = `mutation { issueCreate(input: {
     title: ${JSON.stringify(title)},
     description: ${JSON.stringify(description || '')},
@@ -104,7 +104,7 @@ async function createLinearIssue({ title, description, teamId, priority, parentI
 async function attachAgentLabel(issueId, agentId) {
   const labelQuery = `{ issueLabels(filter: { name: { eq: "agent:${agentId}" } }) { nodes { id } } }`;
   const lr = await graphql(labelQuery);
-  const label = lr.data.issueLabels.nodes[0];
+  const label = lr.data && lr.data.issueLabels && lr.data.issueLabels.nodes[0];
   if (label) {
     await graphql(`mutation { issueUpdate(id: "${issueId}", input: { labelIds: { addIds: ["${label.id}"] } }) { success } }`);
   }
@@ -123,26 +123,31 @@ function startAgentWithLinearIssue(agentId, issue) {
   const agentDir = `/Users/openclaw/.openclaw/agents/${agentId}`;
   const sessionsDir = `${agentDir}/sessions`;
 
-  // Clean stale lock files
   if (fs.existsSync(sessionsDir)) {
-    const lockFiles = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.lock'));
-    for (const f of lockFiles) {
-      fs.unlinkSync(`${sessionsDir}/${f}`);
-    }
+    try {
+      const lockFiles = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.lock'));
+      for (const f of lockFiles) {
+        fs.unlinkSync(`${sessionsDir}/${f}`);
+      }
+    } catch (e) {}
   }
 
   const preamble = `You have been activated on Linear issue ${issue.identifier}: "${issue.title}". Your job is to work through this issue thoroughly. Mark it as "In Review" when done. Use curl to update Linear state via the GraphQL API - write scripts to /tmp/ if needed.`;
 
-  const child = spawn('openclaw', [
-    'agent', agentId,
-    '--message', `${preamble}\n\nIssue: ${issue.identifier} - ${issue.title}\nDescription: ${issue.description || ''}`
-  ], {
-    cwd: agentDir,
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, LINEAR_API_KEY, GITHUB_TOKEN },
-  });
-  child.unref();
+  try {
+    const child = spawn('openclaw', [
+      'agent', agentId,
+      '--message', `${preamble}\n\nIssue: ${issue.identifier} - ${issue.title}\nDescription: ${issue.description || ''}`
+    ], {
+      cwd: agentDir,
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, LINEAR_API_KEY, GITHUB_TOKEN },
+    });
+    child.unref();
+  } catch (e) {
+    console.error(`Failed to start agent ${agentId}: ${e.message}`);
+  }
 
   return { success: true, activationId: `act-${Date.now()}-${Math.random().toString(36).substr(2, 9)}` };
 }
@@ -152,24 +157,23 @@ async function handleLinearWebhook(payload) {
   const { action, data } = payload;
   if (!data || !data.id || !action) return { handled: false, action: 'skipped: no issue data' };
 
-  const newState = data.state?.name;
+  const newState = data.state && data.state.name;
   const identifier = data.identifier || 'Unknown';
   const title = data.title || 'No title';
 
   // ─── Issue moved to "Blocked" ───
   if (newState === 'Blocked') {
-    const agentId = extractAgentFromLabels(data.labels?.nodes);
+    const agentId = extractAgentFromLabels(data.labels && data.labels.nodes);
     sendTelegram(`${identifier} BLOCKED by ${agentId || 'unknown'}: "${title}"`);
     return { handled: true, action: `blocker: ${identifier} → Blocked, notified` };
   }
 
-  // Only process "In Review" transitions
   if (newState !== 'In Review') {
     return { handled: true, action: `broadcast: ${identifier} → ${newState}` };
   }
 
   // ─── Issue moved to "In Review" ───
-  const agentId = extractAgentFromLabels(data.labels?.nodes);
+  const agentId = extractAgentFromLabels(data.labels && data.labels.nodes);
   if (!agentId) return { handled: true, action: `no agent label on ${identifier}, skipped pipeline` };
 
   // BA auto-route
@@ -181,8 +185,12 @@ async function handleLinearWebhook(payload) {
     else if (beMatch) targetAgentId = 'backend-em';
 
     if (targetAgentId) {
-      await attachAgentLabel(data.id, targetAgentId).catch(() => {});
-      startAgentWithLinearIssue(targetAgentId, { identifier, title, description: data.description || '' });
+      try { await attachAgentLabel(data.id, targetAgentId); } catch (e) {}
+      startAgentWithLinearIssue(targetAgentId, {
+        identifier: identifier,
+        title: title,
+        description: data.description || '',
+      });
       return { handled: true, action: `ba-auto-route: ${identifier} -> ${targetAgentId}` };
     }
   }
@@ -193,16 +201,13 @@ async function handleLinearWebhook(payload) {
     return { handled: true, action: `pipeline end for ${agentId}` };
   }
 
-  // Find team and Todo state
   let teamId;
-  const eventTeamKey = data.team?.key;
+  const eventTeamKey = data.team && data.team.key;
   if (eventTeamKey) {
-    const team = await findTeamByKey(eventTeamKey).catch(() => null);
-    if (team) teamId = team.id;
+    try { const t = await findTeamByKey(eventTeamKey); teamId = t.id; } catch (e) {}
   }
   if (!teamId) {
-    const team = await findTeamByKey('ORA').catch(() => null);
-    if (team) teamId = team.id;
+    try { const t = await findTeamByKey('ORA'); teamId = t.id; } catch (e) {}
   }
   if (!teamId) return { handled: false, action: 'failed: could not find team' };
 
@@ -210,7 +215,6 @@ async function handleLinearWebhook(payload) {
   try { todoStateId = await findWorkflowState(teamId, 'Todo'); } catch (e) { return { handled: false, action: 'failed: no Todo state' }; }
 
   for (const nextAgentId of nextAgents) {
-    const nextAgentName = getAgentDisplayName(nextAgentId) || nextAgentId;
     try {
       const nextIssue = await createLinearIssue({
         title: `Review: ${title}`,
@@ -221,18 +225,17 @@ async function handleLinearWebhook(payload) {
       });
 
       await attachAgentLabel(nextIssue.id, nextAgentId);
-      await addComment(data.id, `Pipeline: Created ${nextIssue.identifier} for ${nextAgentName}`).catch(() => {});
+      await addComment(data.id, `Pipeline: Created ${nextIssue.identifier} for ${getAgentDisplayName(nextAgentId)}`).catch(() => {});
 
-      // Transition to In Review so webhook auto-routes
-      try {
-        await transitionIssue(nextIssue.id, todoStateId);
-      } catch (e) {}
+      try { await transitionIssue(nextIssue.id, todoStateId); } catch (e) {}
 
       startAgentWithLinearIssue(nextAgentId, {
         identifier: nextIssue.identifier,
         title: `Review: ${title}`,
         description: `Auto-created from pipeline after ${agentId} completed ${identifier}`,
       });
+
+      console.log(`Pipeline: ${identifier} → ${nextIssue.identifier} → ${nextAgentId}`);
     } catch (e) {
       console.error(`Pipeline: failed to create ticket for ${nextAgentId}: ${e.message}`);
     }
@@ -243,15 +246,19 @@ async function handleLinearWebhook(payload) {
 
 // ─── Telegram helper ───
 function sendTelegram(text) {
-  const postData = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' });
-  const req = https.request({
-    hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
-  });
-  req.write(postData);
-  req.end();
+  try {
+    const postData = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown' });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
+    });
+    req.write(postData);
+    req.end();
+  } catch (e) {
+    console.warn('Telegram send failed:', e.message);
+  }
 }
 
 // ─── GitHub sync ───
@@ -286,7 +293,7 @@ async function checkStaleBlockers() {
         nodes { identifier title updatedAt labels { nodes { name } } }
       }
     }`);
-    const staleBlockers = d.data.issues.nodes || [];
+    const staleBlockers = (d.data && d.data.issues && d.data.issues.nodes) || [];
     if (staleBlockers.length > 0) {
       let msg = `⚠️ *Stale Blocker Alert* — ${staleBlockers.length} ticket(s) blocked >24h:\n\n`;
       for (const issue of staleBlockers) {
@@ -304,44 +311,34 @@ const app = express();
 const PORT = process.env.PORT || 3003;
 
 const wss = new WebSocketServer({ port: 3004 });
-wss.on('error', () => {
-  // Port already in use — local backend runs WS on same port, that's fine
-});
+wss.on('error', function() { /* Port in use locally - non-fatal */ });
+
 const clients = new Set();
 
-wss.on('connection', (ws) => {
+wss.on('connection', function(ws) {
   clients.add(ws);
-  ws.on('close', () => clients.delete(ws));
+  ws.on('close', function() { clients.delete(ws); });
 });
 
 function broadcast(data) {
   const msg = JSON.stringify(data);
-  clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+  clients.forEach(function(c) { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-app.get('/health', (req, res) => {
+app.get('/health', function(req, res) {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.post('/webhook/linear', async (req, res) => {
+app.post('/webhook/linear', async function(req, res) {
   const event = req.body;
   console.log('📨 Linear webhook:', event.type || event.action || 'unknown');
   if (event.data && event.data.id && event.action) {
     try {
       const result = await handleLinearWebhook(event);
-      console.log(`📨 Webhook: ${result.handled ? '✓' : '✗'} ${result.action}`);
-      broadcast({
-        type: 'activity',
-        data: {
-          id: `linear-${Date.now()}`,
-          user: 'Linear',
-          action: `${event.data.identifier}: ${event.action}`,
-          time: new Date().toISOString(),
-        }
-      });
+      console.log('📨 Webhook:', result.handled ? '✓' : '✗', result.action);
     } catch (e) {
       console.error('❌ Webhook handler error:', e.message);
     }
@@ -349,7 +346,7 @@ app.post('/webhook/linear', async (req, res) => {
   res.json({ success: true, message: 'Webhook processed' });
 });
 
-app.get('/api/linear/issues', async (req, res) => {
+app.get('/api/linear/issues', async function(req, res) {
   if (!LINEAR_API_KEY) return res.json({ success: false, issues: [] });
   try {
     const d = await graphql(`{
@@ -363,26 +360,28 @@ app.get('/api/linear/issues', async (req, res) => {
         }
       }
     }`);
-    const issues = (d.data.issues.nodes || []).map(issue => ({
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      status: issue.state.name,
-      team: issue.team.key,
-      teamName: issue.team.name,
-      createdAt: issue.createdAt,
-      labels: (issue.labels.nodes || []).map(l => l.name),
-      agentLabels: (issue.labels.nodes || [])
-        .filter(l => l.name.startsWith('agent:'))
-        .map(l => l.name.replace('agent:', '')),
-    }));
-    res.json({ success: true, issues });
+    const issues = (d.data.issues.nodes || []).map(function(issue) {
+      return {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        status: issue.state.name,
+        team: issue.team.key,
+        teamName: issue.team.name,
+        createdAt: issue.createdAt,
+        labels: (issue.labels.nodes || []).map(function(l) { return l.name; }),
+        agentLabels: (issue.labels.nodes || [])
+          .filter(function(l) { return l.name.startsWith('agent:'); })
+          .map(function(l) { return l.name.replace('agent:', ''); }),
+      };
+    });
+    res.json({ success: true, issues: issues });
   } catch (e) {
     res.json({ success: false, issues: [], error: e.message });
   }
 });
 
-app.get('/api/pipeline/state', async (req, res) => {
+app.get('/api/pipeline/state', async function(req, res) {
   if (!LINEAR_API_KEY) return res.json({ pipeline: null, error: 'No API key' });
   try {
     const d = await graphql(`{
@@ -398,18 +397,18 @@ app.get('/api/pipeline/state', async (req, res) => {
     const issues = d.data.issues.nodes || [];
     const stateOrder = ['Backlog', 'Todo', 'In Progress', 'In Review', 'Blocked', 'Done', 'Canceled'];
     const byState = {};
-    issues.forEach(i => {
-      const s = i.state.name;
+    issues.forEach(function(i) {
+      var s = i.state.name;
       if (!byState[s]) byState[s] = { count: 0, tickets: [] };
       byState[s].count++;
       byState[s].tickets.push({
         id: i.identifier,
         title: i.title,
-        agent: (i.labels.nodes || []).filter(l => l.name.startsWith('agent:')).map(l => l.name.replace('agent:', '')),
+        agent: (i.labels.nodes || []).filter(function(l) { return l.name.startsWith('agent:'); }).map(function(l) { return l.name.replace('agent:', ''); }),
         updatedAt: i.updatedAt,
       });
     });
-    const organizedStates = stateOrder.filter(s => byState[s]).map(s => ({ name: s, ...byState[s] }));
+    var organizedStates = stateOrder.filter(function(s) { return byState[s]; }).map(function(s) { return { name: s, count: byState[s].count, tickets: byState[s].tickets }; });
     res.json({ pipeline: { states: organizedStates } });
   } catch (e) {
     res.json({ pipeline: null, error: e.message });
@@ -417,20 +416,20 @@ app.get('/api/pipeline/state', async (req, res) => {
 });
 
 // ─── Start ───
-app.listen(PORT, () => {
-  console.log(`🚀 HR Dashboard backend on port ${PORT}`);
-  console.log(`🔗 Webhook: POST /webhook/linear`);
-  console.log(`🔗 Pipeline: GET /api/pipeline/state`);
+app.listen(PORT, function() {
+  console.log('🚀 HR Dashboard backend on port ' + PORT);
+  console.log('🔗 Webhook: POST /webhook/linear');
+  console.log('🔗 Pipeline: GET /api/pipeline/state');
 
   setInterval(checkStaleBlockers, 30 * 60 * 1000);
 
-  setTimeout(() => {
+  setTimeout(function() {
     syncGitHubTickets()
-      .then(r => console.log(`📦 GitHub: ${r.issues} issues, ${r.prs} PRs`))
-      .catch(() => {});
+      .then(function(r) { console.log('📦 GitHub: ' + r.issues + ' issues, ' + r.prs + ' PRs'); })
+      .catch(function() {});
   }, 5000);
-  setInterval(() => syncGitHubTickets().catch(() => {}), 60 * 1000);
+  setInterval(function() { syncGitHubTickets().catch(function() {}); }, 60 * 1000);
 
-  console.log(`\n📋 LINEAR_API_KEY: ${LINEAR_API_KEY ? '✅' : '❌'}`);
-  console.log(`📋 GITHUB_TOKEN: ${GITHUB_TOKEN ? '✅' : '❌'}`);
+  console.log('\n📋 LINEAR_API_KEY: ' + (LINEAR_API_KEY ? '✅' : '❌'));
+  console.log('📋 GITHUB_TOKEN: ' + (GITHUB_TOKEN ? '✅' : '❌'));
 });
