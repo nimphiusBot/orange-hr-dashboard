@@ -27,11 +27,11 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const PIPELINE = {
   'ba-platform': ['frontend-em', 'backend-em'],
   'frontend-em': ['design-system-engineer'],
-  'design-system-engineer': ['main'],
-  'backend-em': ['main'],
+  'backend-em': ['documentation-specialist'],
+  'design-system-engineer': ['documentation-specialist'],
+  'documentation-specialist': ['main'],
   'main': ['qa-expert'],
-  'qa-expert': ['documentation-specialist'],
-  'documentation-specialist': [],
+  'qa-expert': [],
 };
 
 const AGENT_DISPLAY_NAMES = {
@@ -39,9 +39,9 @@ const AGENT_DISPLAY_NAMES = {
   'frontend-em': 'Frontend EM',
   'backend-em': 'Backend EM',
   'design-system-engineer': 'DS Engineer',
+  'documentation-specialist': 'Doc Specialist',
   'main': 'CTO',
   'qa-expert': 'QA Expert',
-  'documentation-specialist': 'Doc Specialist',
 };
 
 function getNextInPipeline(agentId) {
