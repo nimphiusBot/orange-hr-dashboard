@@ -60,12 +60,17 @@ function extractAgentFromLabels(labels) {
 }
 
 // ─── Linear API helpers ───
-function graphql(query) {
-  return fetch(LINEAR_API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': LINEAR_API_KEY },
-    body: JSON.stringify({ query }),
-  }).then(r => r.json());
+async function graphql(query) {
+  try {
+    var res = await fetch(LINEAR_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': LINEAR_API_KEY },
+      body: JSON.stringify({ query }),
+    });
+    return await res.json();
+  } catch (e) {
+    return { error: 'fetch_failed', message: e.message };
+  }
 }
 
 async function findTeamByKey(key) {
@@ -293,7 +298,8 @@ async function checkStaleBlockers() {
         nodes { identifier title updatedAt labels { nodes { name } } }
       }
     }`);
-    const staleBlockers = (d.data && d.data.issues && d.data.issues.nodes) || [];
+    var gqlData = d.data || {};
+    const staleBlockers = (gqlData.issues && gqlData.issues.nodes) || [];
     if (staleBlockers.length > 0) {
       let msg = `⚠️ *Stale Blocker Alert* — ${staleBlockers.length} ticket(s) blocked >24h:\n\n`;
       for (const issue of staleBlockers) {
@@ -360,7 +366,7 @@ app.get('/api/linear/issues', async function(req, res) {
         }
       }
     }`);
-    const issues = (d.data.issues.nodes || []).map(function(issue) {
+    const issues = (d.data && d.data.issues && d.data.issues.nodes || []).map(function(issue) {
       return {
         id: issue.id,
         identifier: issue.identifier,
@@ -394,7 +400,7 @@ app.get('/api/pipeline/state', async function(req, res) {
         }
       }
     }`);
-    const issues = d.data.issues.nodes || [];
+    const issues = (d.data && d.data.issues && d.data.issues.nodes) || [];
     const stateOrder = ['Backlog', 'Todo', 'In Progress', 'In Review', 'Blocked', 'Done', 'Canceled'];
     const byState = {};
     issues.forEach(function(i) {
